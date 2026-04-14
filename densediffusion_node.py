@@ -1,6 +1,8 @@
 from __future__ import annotations
 import itertools
+import logging
 import math
+import os
 from typing import Literal
 from dataclasses import dataclass
 
@@ -10,6 +12,10 @@ import comfy
 from comfy.model_patcher import ModelPatcher
 
 from .enums import StableDiffusionVersion
+
+_dd_logger = logging.getLogger("DenseDiffusion")
+_DD_DEBUG = os.environ.get("DENSEDIFFUSION_DEBUG", "").strip().lower() in ("1", "true", "yes")
+_dd_debug_logged_for: set = set()  # tracks prompt_ids already logged
 
 
 ComfyUIConditioning = list  # Dummy type definitions for ComfyUI
@@ -74,9 +80,10 @@ class OmostDenseDiffusionCrossAttention(torch.nn.Module):
                 elif mask.size(0) != cond_batch_size:
                     mask = mask[:cond_batch_size]  # Take first cond_batch_size masks
                 
-                # Resize mask
+                # Resize mask in float16: nearest-exact upsample kernels are not
+                # implemented for float8 dtypes (e.g. Float8_e4m3fn).
                 m = torch.nn.functional.interpolate(
-                    mask.unsqueeze(1),  # [B, 1, H, W]
+                    mask.to(dtype=torch.float16).unsqueeze(1),  # [B, 1, H, W]
                     (H, W),
                     mode="nearest-exact"
                 ).flatten(1)  # [B, H*W]
@@ -88,7 +95,9 @@ class OmostDenseDiffusionCrossAttention(torch.nn.Module):
             masks = torch.cat(masks, dim=2)  # Concatenate along embedding dimension
             
             mask_bool = masks > 0.5
-            mask_scale = (H * W) / torch.sum(masks, dim=1, keepdim=True)
+            # Prevent Inf scale values when any conditioning channel has near-zero masked area.
+            mask_denom = torch.sum(masks, dim=1, keepdim=True).clamp_min(1e-6)
+            mask_scale = (H * W) / mask_denom
             
             # Reshape for attention computation
             mask_bool = mask_bool.unsqueeze(1).repeat(1, q.size(1), 1, 1)
@@ -135,12 +144,55 @@ class OmostDenseDiffusionCrossAttention(torch.nn.Module):
         scale_factor = 1 / math.sqrt(query.size(-1))
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
 
+        def _align_mask(mask: torch.Tensor, name: str) -> torch.Tensor:
+            # Ensure the mask has the same rank as attention weights.
+            while mask.ndim < attn_weight.ndim:
+                mask = mask.unsqueeze(0)
+
+            # Expand/repeat each dimension to match attention shape.
+            for dim in range(attn_weight.ndim):
+                current = mask.size(dim)
+                target = attn_weight.size(dim)
+                if current == target:
+                    continue
+                if current == 1:
+                    expand_shape = list(mask.shape)
+                    expand_shape[dim] = target
+                    mask = mask.expand(*expand_shape)
+                    continue
+                if target % current == 0:
+                    mask = mask.repeat_interleave(target // current, dim=dim)
+                    continue
+
+                raise RuntimeError(
+                    f"DenseDiffusion {name} shape {tuple(mask.shape)} cannot align with attention shape {tuple(attn_weight.shape)}"
+                )
+
+            return mask
+
         if mask_scale is not None:
+            mask_scale = _align_mask(
+                mask_scale.to(device=attn_weight.device, dtype=attn_weight.dtype),
+                "mask_scale",
+            )
+            mask_scale = torch.nan_to_num(mask_scale, nan=1.0, posinf=1.0, neginf=1.0)
             attn_weight = attn_weight * mask_scale
         if mask_bool is not None:
+            mask_bool = _align_mask(
+                mask_bool.to(device=attn_weight.device, dtype=torch.bool),
+                "mask_bool",
+            )
+
+            # Avoid all -inf rows (which become NaN after softmax) by disabling masking
+            # for query rows that would otherwise be fully masked.
+            fully_masked = mask_bool.logical_not().all(dim=-1, keepdim=True)
+            if fully_masked.any():
+                mask_bool = mask_bool | fully_masked
+
             attn_weight.masked_fill_(mask_bool.logical_not(), float("-inf"))
 
         attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_weight = torch.nan_to_num(attn_weight, nan=0.0, posinf=0.0, neginf=0.0)
         return attn_weight @ value
 
     def forward(
@@ -165,6 +217,35 @@ class OmostDenseDiffusionCrossAttention(torch.nn.Module):
             (q, k, v),
         )
         mask_bool, mask_scale = self.calc_mask_cond(q, extra_options)
+
+        if _DD_DEBUG and mask_bool is not None:
+            prompt_id = extra_options.get("prompt_id", "unknown")
+            if prompt_id not in _dd_debug_logged_for:
+                _dd_debug_logged_for.add(prompt_id)
+                # Keep set bounded
+                if len(_dd_debug_logged_for) > 50:
+                    _dd_debug_logged_for.clear()
+                    _dd_debug_logged_for.add(prompt_id)
+                with torch.no_grad():
+                    mb = mask_bool[0]  # first batch item, shape [heads, H*W, total_T]
+                    total_positions = mb.shape[1]
+                    # Per-head average across heads → [H*W, total_T]
+                    mb_any_head = mb.float().mean(dim=0) > 0.5
+                    true_per_pos = mb_any_head.sum(dim=-1)  # tokens True per position
+                    fully_true = (true_per_pos == mb_any_head.shape[-1]).sum().item()
+                    fully_false = (true_per_pos == 0).sum().item()
+                    partial = total_positions - fully_true - fully_false
+                    coverage = mb_any_head.float().mean(dim=0)  # per-token coverage
+                    _dd_logger.info(
+                        "[DenseDiffusion DIAG] prompt=%s | q=%s mask_bool=%s mask_scale=%s | "
+                        "positions: fully_open=%d partial=%d fully_masked=%d / %d | "
+                        "per_token_coverage(first5)=%s",
+                        prompt_id, tuple(q.shape), tuple(mask_bool.shape),
+                        tuple(mask_scale.shape) if mask_scale is not None else None,
+                        fully_true, partial, fully_false, total_positions,
+                        [f"{v:.3f}" for v in coverage[:5].tolist()],
+                    )
+
         out = self.scaled_dot_product_attention(
             q, k, v, mask_bool=mask_bool, mask_scale=mask_scale
         )
@@ -184,7 +265,6 @@ class DenseDiffusionApplyNode:
 
     def apply(self, model: ModelPatcher) -> tuple[ModelPatcher]:
         work_model: ModelPatcher = model.clone()
-
         # TODO: Make patching cross-attn easier/more composable with Unified ModelPatcher.
         # Current approach does not compose with IPAdapter.
         sd_version: StableDiffusionVersion = get_sd_version(work_model)
